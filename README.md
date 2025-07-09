@@ -25,7 +25,171 @@ Each patient has 2000 tiles per modality, and the model learns to:
 - **Aleatoric Uncertainty**: Bootstrap sampling for confidence intervals
 - **Survival Analysis**: Bayesian Cox proportional hazards or AFT models
 
-## Key Features
+## Schematic Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    BAYESIAN MIL FOR GBM RECURRENCE PREDICTION              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   PATIENT DATA  │    │   HISTOLOGY     │    │ SPATIAL RNA-SEQ │
+│                 │    │   EMBEDDINGS    │    │   EMBEDDINGS    │
+│  Patient_01     │    │  (2000 tiles)   │    │  (2000 tiles)   │
+│  Patient_02     │    │  (512 dims)     │    │  (512 dims)     │
+│  ...            │    │                 │    │                 │
+│  Patient_17     │    └─────────────────┘    └─────────────────┘
+└─────────────────┘              │                      │
+                                 │                      │
+                                 ▼                      ▼
+                    ┌─────────────────────────────────────────┐
+                    │         MULTIMODAL FUSION              │
+                    │      Concatenate embeddings            │
+                    │      (2000 tiles × 1024 dims)         │
+                    └─────────────────────────────────────────┘
+                                         │
+                                         ▼
+                    ┌─────────────────────────────────────────┐
+                    │      ATTENTION-BASED MIL MODEL        │
+                    │                                       │
+                    │  ┌─────────────────────────────────┐   │
+                    │  │     Embedding Layer            │   │
+                    │  │  (1024 → 128 dims + Dropout)   │   │
+                    │  └─────────────────────────────────┘   │
+                    │                    │                   │
+                    │                    ▼                   │
+                    │  ┌─────────────────────────────────┐   │
+                    │  │     Attention Mechanism        │   │
+                    │  │  • V: Intermediate transform   │   │
+                    │  │  • U: Attention scores         │   │
+                    │  │  • Softmax normalization       │   │
+                    │  └─────────────────────────────────┘   │
+                    │                    │                   │
+                    │                    ▼                   │
+                    │  ┌─────────────────────────────────┐   │
+                    │  │     Weighted Pooling          │   │
+                    │  │  • Attention-weighted sum      │   │
+                    │  │  • Patient-level embedding     │   │
+                    │  └─────────────────────────────────┘   │
+                    │                    │                   │
+                    │                    ▼                   │
+                    │  ┌─────────────────────────────────┐   │
+                    │  │     Classifier + Dropout       │   │
+                    │  │  • Risk score output           │   │
+                    │  │  • MC dropout for uncertainty  │   │
+                    │  └─────────────────────────────────┘   │
+                    └─────────────────────────────────────────┘
+                                         │
+                                         ▼
+                    ┌─────────────────────────────────────────┐
+                    │         BAYESIAN SURVIVAL MODEL       │
+                    │                                       │
+                    │  ┌─────────────────────────────────┐   │
+                    │  │      Cox Model                │   │
+                    │  │  • Baseline hazard            │   │
+                    │  │  • Parametric covariates      │   │
+                    │  │  • MCMC sampling              │   │
+                    │  └─────────────────────────────────┘   │
+                    │                                       │
+                    │  ┌─────────────────────────────────┐   │
+                    │  │      AFT Model                │   │
+                    │  │  • Weibull distribution       │   │
+                    │  │  • Accelerated failure time   │   │
+                    │  │  • Full Bayesian inference    │   │
+                    │  └─────────────────────────────────┘   │
+                    └─────────────────────────────────────────┘
+                                         │
+                                         ▼
+                    ┌─────────────────────────────────────────┐
+                    │         UNCERTAINTY QUANTIFICATION    │
+                    │                                       │
+                    │  ┌─────────────────────────────────┐   │
+                    │  │    Epistemic Uncertainty      │   │
+                    │  │  • Monte Carlo dropout        │   │
+                    │  │  • Model uncertainty           │   │
+                    │  │  • 100 MC samples             │   │
+                    │  └─────────────────────────────────┘   │
+                    │                                       │
+                    │  ┌─────────────────────────────────┐   │
+                    │  │    Aleatoric Uncertainty      │   │
+                    │  │  • Bootstrap sampling          │   │
+                    │  │  • Data uncertainty            │   │
+                    │  │  • 100 bootstrap samples       │   │
+                    │  └─────────────────────────────────┘   │
+                    └─────────────────────────────────────────┘
+                                         │
+                                         ▼
+                    ┌─────────────────────────────────────────┐
+                    │              PREDICTIONS               │
+                    │                                       │
+                    │  ┌─────────────────────────────────┐   │
+                    │  │  Recurrence Status             │   │
+                    │  │  • Binary classification       │   │
+                    │  │  • Probability with CI         │   │
+                    │  │  • ROC-AUC evaluation          │   │
+                    │  └─────────────────────────────────┘   │
+                    │                                       │
+                    │  ┌─────────────────────────────────┐   │
+                    │  │  Recurrence Time               │   │
+                    │  │  • Survival analysis           │   │
+                    │  │  • Risk scores with CI         │   │
+                    │  │  • Concordance index           │   │
+                    │  └─────────────────────────────────┘   │
+                    └─────────────────────────────────────────┘
+                                         │
+                                         ▼
+                    ┌─────────────────────────────────────────┐
+                    │           INTERPRETABILITY             │
+                    │                                       │
+                    │  ┌─────────────────────────────────┐   │
+                    │  │    Attention Maps              │   │
+                    │  │  • Tile importance weights     │   │
+                    │  │  • Heatmap visualization       │   │
+                    │  │  • Top-k important tiles       │   │
+                    │  └─────────────────────────────────┘   │
+                    │                                       │
+                    │  ┌─────────────────────────────────┐   │
+                    │  │    Uncertainty Analysis        │   │
+                    │  │  • Prediction vs uncertainty   │   │
+                    │  │  • Confidence intervals         │   │
+                    │  │  • Risk stratification          │   │
+                    │  └─────────────────────────────────┘   │
+                                        └─────────────────────────────────────────┘
+                    ```
+                    
+                    ## Mathematical Formulation
+                    
+                    ### Attention-Based MIL
+                    
+                    Given a bag of tiles $X = \{x_1, x_2, ..., x_T\}$ for a patient, where each tile $x_i \in \mathbb{R}^{1024}$:
+                    
+                    1. **Embedding**: $h_i = \text{ReLU}(W_e x_i + b_e)$
+                    2. **Attention**: $a_i = \frac{\exp(u^T \tanh(Vh_i))}{\sum_{j=1}^T \exp(u^T \tanh(Vh_j))}$
+                    3. **Pooling**: $M = \sum_{i=1}^T a_i h_i$
+                    4. **Prediction**: $y = \sigma(W_c M + b_c)$
+                    
+                    Where $W_e, V, U, W_c$ are learnable parameters and $\sigma$ is sigmoid activation.
+                    
+                    ### Bayesian Uncertainty
+                    
+                    **Epistemic Uncertainty** (Model uncertainty):
+                    - Monte Carlo dropout: $p(y|x) \approx \frac{1}{S} \sum_{s=1}^S p(y|x, \theta_s)$
+                    - Variance: $\text{Var}[y] = \mathbb{E}[y^2] - (\mathbb{E}[y])^2$
+                    
+                    **Aleatoric Uncertainty** (Data uncertainty):
+                    - Bootstrap sampling: $\text{CI}_{95\%} = [\text{percentile}_{2.5}, \text{percentile}_{97.5}]$
+                    
+                    ### Survival Analysis
+                    
+                    **Cox Proportional Hazards**:
+                    - Hazard function: $h(t|x) = h_0(t) \exp(\beta^T x)$
+                    - Survival function: $S(t|x) = S_0(t)^{\exp(\beta^T x)}$
+                    
+                    **Accelerated Failure Time (AFT)**:
+                    - Log-survival time: $\log(T) = \beta^T x + \sigma W$
+                    - Where $W \sim \text{Weibull}(1, 1)$
+                    
+                    ## Key Features
 
 - **Multimodal Integration**: Combines histology and spatial transcriptomics data
 - **Uncertainty Quantification**: Both epistemic and aleatoric uncertainty estimation
@@ -241,5 +405,8 @@ python train_model.bayesian.py \
 ## Future Enhancements
 
 1. **Co-Attention Mechanism/Cross-Modal Contrastive Learner**: Learn cross-modal attention patterns
+
+
+
 
 
