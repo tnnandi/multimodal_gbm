@@ -79,6 +79,8 @@ def parse_args():
                         help='Use Monte Carlo dropout for epistemic uncertainty')
     parser.add_argument('--n_mc_samples', type=int, default=100,
                         help='Number of Monte Carlo samples for uncertainty estimation')
+    parser.add_argument('--alpha', type=float, default=0.5,
+                        help='Weight for histology modality in fusion (0.0-1.0, default=0.5)')
     
     # Model parameters
     parser.add_argument('--hidden_dim', type=int, default=128,
@@ -127,6 +129,7 @@ survival_model = args.survival_model
 use_mc_dropout = args.use_mc_dropout
 n_mc_samples = args.n_mc_samples
 num_epochs = args.num_epochs
+alpha = args.alpha # Added alpha to args
 
 # Load labels
 labels_df = pd.read_csv(os.path.join(DATA_DIR, 'labels.csv'))
@@ -159,91 +162,92 @@ class MultimodalMILBag(Dataset):
         st_embeddings = st_df.drop(columns=['tile_id']).values  # shape: (num_tiles, embedding_dim)
         st_tensor = torch.tensor(st_embeddings, dtype=torch.float32)
 
-        # Concatenate modalities for each tile
-        # shape: (num_tiles, 2*embedding_dim)
-        # TODO: consider other ways to combine modalities (e.g., weighted sum) to keep the total embedding dim the same
-        combined_tiles = torch.cat([hist_tensor, st_tensor], dim=1)
+        # Return as dict for separate attention modules
+        tiles_dict = {
+            'histology': hist_tensor,
+            'spatial_rnaseq': st_tensor
+        }
 
         # Load label
         if self.predict_type == "recurrence_status":
             label = self.labels_df.loc[patient_id, 'recurrence_status']
-            time = torch.tensor(0.0, dtype=torch.float32)  # Not used for classification
             event = torch.tensor(label, dtype=torch.float32)
+            return tiles_dict, event
         elif self.predict_type == "recurrence_time":
             time = self.labels_df.loc[patient_id, 'recurrence_time']
             event = self.labels_df.loc[patient_id, 'recurrence_status']
             time_tensor = torch.tensor(time, dtype=torch.float32)
             event_tensor = torch.tensor(event, dtype=torch.float32)
+            return tiles_dict, time_tensor, event_tensor
         else:
             raise ValueError(f"Unsupported predict_type: {self.predict_type}")
 
-        if self.predict_type == "recurrence_status":
-            return combined_tiles, event
-        else:
-            return combined_tiles, time_tensor, event_tensor
-
-# Bayesian MIL model with attention pooling and Monte Carlo dropout
-class BayesianAttentionMIL(nn.Module):
-    def __init__(self, input_dim=1024, hidden_dim=128, predict_type="recurrence_time", dropout_rate=0.2):
-        super(BayesianAttentionMIL, self).__init__()
-        self.predict_type = predict_type
-        self.dropout_rate = dropout_rate
-        
-        # Embedding layers with dropout for epistemic uncertainty
+# Attention MIL for a single modality
+class AttentionMIL(nn.Module):
+    def __init__(self, input_dim=512, hidden_dim=128, dropout_rate=0.2):
+        super().__init__()
         self.embedding = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout_rate)
         )
-        
-        # Attention mechanism
         self.attention_V = nn.Linear(hidden_dim, hidden_dim)
         self.attention_U = nn.Linear(hidden_dim, 1)
-        
-        # Output layer with dropout
+
+    def forward(self, x):
+        H = self.embedding(x)  # [T, H]
+        A = torch.tanh(self.attention_V(H))
+        A = self.attention_U(A)
+        A = torch.softmax(A, dim=0)  # [T, 1]
+        M = torch.sum(A * H, dim=0)  # [H]
+        return M, A  # patient embedding, attention map
+
+# Bayesian MIL model with separate attention and weighted fusion
+class BayesianAttentionMIL(nn.Module):
+    def __init__(self, input_dim=512, hidden_dim=128, predict_type="recurrence_time", dropout_rate=0.2, alpha=0.5):
+        super().__init__()
+        self.predict_type = predict_type
+        self.dropout_rate = dropout_rate
+        self.alpha = alpha
+        # Separate attention modules
+        self.mil_hist = AttentionMIL(input_dim, hidden_dim, dropout_rate)
+        self.mil_st = AttentionMIL(input_dim, hidden_dim, dropout_rate)
+        # Output layer
+        fusion_dim = hidden_dim
         if predict_type == "recurrence_status":
             self.classifier = nn.Sequential(
                 nn.Dropout(dropout_rate),
-                nn.Linear(hidden_dim, 1)
+                nn.Linear(fusion_dim, 1)
             )
         else:
-            # For survival analysis, output is risk score
             self.classifier = nn.Sequential(
                 nn.Dropout(dropout_rate),
-                nn.Linear(hidden_dim, 1)
+                nn.Linear(fusion_dim, 1)
             )
 
-    def forward(self, x, training=True):
-        # Apply dropout during training and MC sampling
-        if training:
-            self.train()
-        else:
-            self.eval()
-        
-        H = self.embedding(x)  # [T, H] # Project tile embedding to latent space
-        A = torch.tanh(self.attention_V(H)) # Intermediate attention transformation
-        A = self.attention_U(A) # Linear projection to scalar attention score
-        A = torch.softmax(A, dim=0)  # normalized attention weights # Ilse 2018, Eq 8
-        M = torch.sum(A * H, dim=0)  # [H] Aggregate to patient-level embedding # Ilse 2018, Eq 7
-        output = self.classifier(M)  # [1] # Predict risk or label from pooled representation
-        return output.squeeze(), A
+    def forward(self, tiles_dict, training=True):
+        # Each modality through its own attention MIL
+        hist_M, hist_A = self.mil_hist(tiles_dict['histology'])
+        st_M, st_A = self.mil_st(tiles_dict['spatial_rnaseq'])
+        # Weighted fusion
+        M = self.alpha * hist_M + (1 - self.alpha) * st_M
+        output = self.classifier(M)
+        return output.squeeze(), {'histology': hist_A, 'spatial_rnaseq': st_A}
 
-    # can turn it off for now
-    def mc_predict(self, x, n_samples=100):
-        """Monte Carlo prediction for uncertainty estimation"""
+    def mc_predict(self, tiles_dict, n_samples=100):
         predictions = []
-        attention_maps = []
-        
+        attention_maps_hist = []
+        attention_maps_st = []
         for _ in range(n_samples):
             with torch.no_grad():
-                pred, attn = self.forward(x, training=True)  # Keep dropout active
+                pred, attn = self.forward(tiles_dict, training=True)
                 predictions.append(pred.item())
-                attention_maps.append(attn.cpu().numpy())
-        
+                attention_maps_hist.append(attn['histology'].cpu().numpy())
+                attention_maps_st.append(attn['spatial_rnaseq'].cpu().numpy())
         predictions = np.array(predictions)
-        attention_maps = np.array(attention_maps)
-        
-        return predictions, attention_maps
+        attention_maps_hist = np.array(attention_maps_hist)
+        attention_maps_st = np.array(attention_maps_st)
+        return predictions, attention_maps_hist, attention_maps_st
 
 # Cox loss for survival analysis
 def cox_loss(risks, times, events):
@@ -364,16 +368,17 @@ def create_data_loaders():
     
     return train_loader, test_loader
 
-def train_attention_model(train_loader, val_loader):
+def train_attention_model(train_loader):
     """Train the attention-based MIL model"""
     print("Training attention-based MIL model...")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = BayesianAttentionMIL(
-        input_dim=1024, 
+        input_dim=512, 
         hidden_dim=args.hidden_dim, 
         predict_type=predict_type,
-        dropout_rate=args.dropout_rate
+        dropout_rate=args.dropout_rate,
+        alpha=args.alpha
     ).to(device)
     
     optimizer = torch.optim.Adam(
@@ -382,63 +387,31 @@ def train_attention_model(train_loader, val_loader):
         weight_decay=args.weight_decay
     )
     
-    best_val_loss = float('inf')
-    
     for epoch in range(num_epochs):
         # Training
         model.train()
         train_loss = 0.0
         
-        for tiles, *labels in train_loader:
-            tiles = tiles.squeeze(0).to(device)
+        for tiles_dict, *labels in train_loader:
+            tiles_dict = {k: v.squeeze(0).to(device) for k, v in tiles_dict.items()}
             labels = [label.to(device) for label in labels]
-            
             optimizer.zero_grad()
-            
             if predict_type == "recurrence_status":
                 event = labels[0]
-                risk, _ = model(tiles, training=True)
+                risk, _ = model(tiles_dict, training=True)
                 loss = bce_loss(risk.unsqueeze(0), event.unsqueeze(0))
             else:
                 time, event = labels
-                risk, _ = model(tiles, training=True)
+                risk, _ = model(tiles_dict, training=True)
                 loss = cox_loss(risk.unsqueeze(0), time.unsqueeze(0), event.unsqueeze(0))
-            
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
-        
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for tiles, *labels in val_loader:
-                tiles = tiles.squeeze(0).to(device)
-                labels = [label.to(device) for label in labels]
-                
-                if predict_type == "recurrence_status":
-                    event = labels[0]
-                    risk, _ = model(tiles, training=False)
-                    loss = bce_loss(risk.unsqueeze(0), event.unsqueeze(0))
-                else:
-                    time, event = labels
-                    risk, _ = model(tiles, training=False)
-                    loss = cox_loss(risk.unsqueeze(0), time.unsqueeze(0), event.unsqueeze(0))
-                
-                val_loss += loss.item()
-        
         avg_train_loss = train_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
-        
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch + 1}/{num_epochs} - Train Loss: {avg_train_loss:.4f} - Val Loss: {avg_val_loss:.4f}")
-        
-        # Save best model
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), MODEL_SAVE_PATH)
-            print("✓ Model saved.")
-    
+            print(f"Epoch {epoch + 1}/{num_epochs} - Train Loss: {avg_train_loss:.4f}")
+    torch.save(model.state_dict(), MODEL_SAVE_PATH)
+    print("✓ Model saved.")
     return model
 
 def extract_features_with_uncertainty(model, data_loader):
@@ -447,36 +420,40 @@ def extract_features_with_uncertainty(model, data_loader):
     
     device = next(model.parameters()).device
     features_list = []
-    attention_maps_list = []
+    attention_maps_hist_list = []
+    attention_maps_st_list = []
     uncertainties_list = []
     
     model.eval()
     with torch.no_grad():
-        for tiles, *labels in data_loader:
-            tiles = tiles.squeeze(0).to(device)
+        for tiles_dict, *labels in data_loader:
+            tiles_dict = {k: v.squeeze(0).to(device) for k, v in tiles_dict.items()}
             
             if use_mc_dropout:
                 # Monte Carlo prediction for uncertainty
-                mc_predictions, mc_attention = model.mc_predict(tiles, n_samples=n_mc_samples)
+                mc_predictions, mc_attention_hist, mc_attention_st = model.mc_predict(tiles_dict, n_samples=n_mc_samples)
                 
                 # Calculate uncertainty metrics
                 mean_prediction = np.mean(mc_predictions)
                 uncertainty = np.std(mc_predictions)
                 
                 # Use mean attention map
-                mean_attention = np.mean(mc_attention, axis=0)
+                mean_attention_hist = np.mean(mc_attention_hist, axis=0)
+                mean_attention_st = np.mean(mc_attention_st, axis=0)
                 
                 features_list.append(mean_prediction)
-                attention_maps_list.append(mean_attention)
+                attention_maps_hist_list.append(mean_attention_hist)
+                attention_maps_st_list.append(mean_attention_st)
                 uncertainties_list.append(uncertainty)
             else:
                 # Single prediction
-                prediction, attention = model(tiles, training=False)
+                prediction, attention = model(tiles_dict, training=False)
                 features_list.append(prediction.item())
-                attention_maps_list.append(attention.cpu().numpy())
+                attention_maps_hist_list.append(attention['histology'].cpu().numpy())
+                attention_maps_st_list.append(attention['spatial_rnaseq'].cpu().numpy())
                 uncertainties_list.append(0.0)  # No uncertainty estimate
     
-    return np.array(features_list), np.array(attention_maps_list), np.array(uncertainties_list)
+    return np.array(features_list), np.array(attention_maps_hist_list), np.array(attention_maps_st_list), np.array(uncertainties_list)
 
 def train_bayesian_survival_model(train_features, train_times, train_events):
     """Train Bayesian survival model on extracted features"""
@@ -497,7 +474,7 @@ def evaluate_with_uncertainty(model, bayesian_model, scaler, test_loader, test_t
     print("Evaluating with uncertainty quantification...")
     
     # Extract features with uncertainty
-    test_features, test_attention, test_uncertainties = extract_features_with_uncertainty(model, test_loader)
+    test_features, test_attention_hist, test_attention_st, test_uncertainties = extract_features_with_uncertainty(model, test_loader)
     
     # Standardize features
     test_features_scaled = scaler.transform(test_features.reshape(-1, 1))
@@ -515,7 +492,7 @@ def evaluate_with_uncertainty(model, bayesian_model, scaler, test_loader, test_t
         print(f"Test Accuracy: {accuracy:.4f}")
         print(f"Mean Uncertainty: {np.mean(test_uncertainties):.4f}")
         
-        return accuracy, predictions, probabilities, test_uncertainties, test_attention
+        return accuracy, predictions, probabilities, test_uncertainties, test_attention_hist, test_attention_st
     else:
         # For survival analysis, use Bayesian model predictions
         predictions = bayesian_model.predict(test_features_scaled)
@@ -526,7 +503,7 @@ def evaluate_with_uncertainty(model, bayesian_model, scaler, test_loader, test_t
         print(f"Test Concordance Index: {c_index:.4f}")
         print(f"Mean Uncertainty: {np.mean(test_uncertainties):.4f}")
         
-        return c_index, predictions, None, test_uncertainties, test_attention
+        return c_index, predictions, None, test_uncertainties, test_attention_hist, test_attention_st
 
 def bootstrap_uncertainty_estimation(model, bayesian_model, scaler, test_loader, n_bootstraps=100):
     """Estimate uncertainty using bootstrap sampling"""
@@ -557,13 +534,13 @@ def bootstrap_uncertainty_estimation(model, bayesian_model, scaler, test_loader,
         
         # Evaluate on bootstrap sample
         if predict_type == "recurrence_status":
-            bootstrap_accuracy, _, _, bootstrap_uncertainty, _ = evaluate_with_uncertainty(
+            bootstrap_accuracy, _, _, bootstrap_uncertainty, _, _ = evaluate_with_uncertainty(
                 model, bayesian_model, scaler, bootstrap_loader, bootstrap_times, bootstrap_events
             )
             bootstrap_scores.append(bootstrap_accuracy)
             bootstrap_uncertainties.append(np.mean(bootstrap_uncertainty))
         else:
-            bootstrap_c_index, _, _, bootstrap_uncertainty, _ = evaluate_with_uncertainty(
+            bootstrap_c_index, _, _, bootstrap_uncertainty, _, _ = evaluate_with_uncertainty(
                 model, bayesian_model, scaler, bootstrap_loader, bootstrap_times, bootstrap_events
             )
             bootstrap_scores.append(bootstrap_c_index)
@@ -583,7 +560,7 @@ def bootstrap_uncertainty_estimation(model, bayesian_model, scaler, test_loader,
     
     return bootstrap_scores, bootstrap_uncertainties
 
-def plot_uncertainty_analysis(predictions, uncertainties, attention_maps, test_times, test_events):
+def plot_uncertainty_analysis(predictions, uncertainties, attention_maps_hist, attention_maps_st, test_times, test_events):
     """Plot uncertainty analysis"""
     print("Plotting uncertainty analysis...")
     
@@ -604,12 +581,20 @@ def plot_uncertainty_analysis(predictions, uncertainties, attention_maps, test_t
     axes[0, 1].grid(True, alpha=0.3)
     
     # Plot 3: Attention map heatmap (mean across patients)
-    mean_attention = np.mean(attention_maps, axis=0)
-    im = axes[1, 0].imshow(mean_attention.T, cmap='viridis', aspect='auto')
+    mean_attention_hist = np.mean(attention_maps_hist, axis=0)
+    mean_attention_st = np.mean(attention_maps_st, axis=0)
+    
+    im_hist = axes[1, 0].imshow(mean_attention_hist.T, cmap='viridis', aspect='auto')
     axes[1, 0].set_xlabel('Patients')
     axes[1, 0].set_ylabel('Tiles')
-    axes[1, 0].set_title('Mean Attention Weights')
-    plt.colorbar(im, ax=axes[1, 0])
+    axes[1, 0].set_title('Mean Attention Weights (Histology)')
+    plt.colorbar(im_hist, ax=axes[1, 0])
+    
+    im_st = axes[1, 1].imshow(mean_attention_st.T, cmap='viridis', aspect='auto')
+    axes[1, 1].set_xlabel('Patients')
+    axes[1, 1].set_ylabel('Tiles')
+    axes[1, 1].set_title('Mean Attention Weights (Spatial RNA-seq)')
+    plt.colorbar(im_st, ax=axes[1, 1])
     
     # Plot 4: Survival curves with uncertainty (if survival analysis)
     if predict_type == "recurrence_time":
@@ -655,29 +640,17 @@ def main():
     print(f"Survival model: {survival_model}")
     print(f"Mode: {mode}")
     print(f"MC Dropout: {use_mc_dropout}")
+    print(f"Alpha: {alpha}")
     
     # Create data loaders
     train_loader, test_loader = create_data_loaders()
     
-    # Split train into train/val for attention model training
-    train_patients = train_loader.dataset.patients
-    train_train_ids, val_ids = train_test_split(train_patients, test_size=0.2, random_state=seed_value)
-    
-    train_train_df = labels_df.loc[train_train_ids]
-    val_df = labels_df.loc[val_ids]
-    
-    train_train_dataset = MultimodalMILBag(train_train_df, DATA_DIR, predict_type)
-    val_dataset = MultimodalMILBag(val_df, DATA_DIR, predict_type)
-    
-    train_train_loader = DataLoader(train_train_dataset, batch_size=1, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
-    
     if mode == 'train':
-        # Train attention model
-        attention_model = train_attention_model(train_train_loader, val_loader)
+        # Train attention model on full train set
+        attention_model = train_attention_model(train_loader)
         
         # Extract features from training data
-        train_features, train_attention, train_uncertainties = extract_features_with_uncertainty(
+        train_features, train_attention_hist, train_attention_st, train_uncertainties = extract_features_with_uncertainty(
             attention_model, train_loader
         )
         
@@ -701,7 +674,7 @@ def main():
         test_times = labels_df.loc[test_loader.dataset.patients, 'recurrence_time'].values
         test_events = labels_df.loc[test_loader.dataset.patients, 'recurrence_status'].values
         
-        score, predictions, probabilities, uncertainties, attention_maps = evaluate_with_uncertainty(
+        score, predictions, probabilities, uncertainties, attention_maps_hist, attention_maps_st = evaluate_with_uncertainty(
             attention_model, bayesian_model, scaler, test_loader, test_times, test_events
         )
         
@@ -718,7 +691,7 @@ def main():
         
         # Plot uncertainty analysis
         if args.plot_uncertainty:
-            plot_uncertainty_analysis(predictions, uncertainties, attention_maps, test_times, test_events)
+            plot_uncertainty_analysis(predictions, uncertainties, attention_maps_hist, attention_maps_st, test_times, test_events)
     
     elif mode == 'test':
         # Load trained models
@@ -726,10 +699,11 @@ def main():
         
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         attention_model = BayesianAttentionMIL(
-            input_dim=1024, 
+            input_dim=512, 
             hidden_dim=args.hidden_dim, 
             predict_type=predict_type,
-            dropout_rate=args.dropout_rate
+            dropout_rate=args.dropout_rate,
+            alpha=args.alpha
         ).to(device)
         attention_model.load_state_dict(model_data['attention_model_state'])
         
@@ -740,7 +714,7 @@ def main():
         test_times = labels_df.loc[test_loader.dataset.patients, 'recurrence_time'].values
         test_events = labels_df.loc[test_loader.dataset.patients, 'recurrence_status'].values
         
-        score, predictions, probabilities, uncertainties, attention_maps = evaluate_with_uncertainty(
+        score, predictions, probabilities, uncertainties, attention_maps_hist, attention_maps_st = evaluate_with_uncertainty(
             attention_model, bayesian_model, scaler, test_loader, test_times, test_events
         )
         
