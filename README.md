@@ -331,18 +331,6 @@ Where $W_e, V, U, W_c$ are learnable parameters and $\sigma$ is sigmoid activati
 - Log-survival time: $\log(T) = \beta^T x + \sigma W$
 - Where $W \sim \text{Weibull}(1, 1)$
 
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@article{bayesian_mil_gbm,
-  title={Bayesian Multi-Instance Learning for Glioblastoma Recurrence Prediction},
-  author={Your Name},
-  journal={Journal Name},
-  year={2024}
-}
-```
 
 ## License
 
